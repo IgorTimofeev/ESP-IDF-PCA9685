@@ -2,20 +2,17 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <utility>
 #include <span>
 #include <cmath>
 #include <cstring>
-#include <initializer_list>
 #include <array>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include <driver/gpio.h>
-#include <driver/i2c_master.h>
-
 #include <esp_timer.h>
+
+#include <driver/i2c_master.h>
 
 namespace YOBA {
 	enum class PCA9685Error : uint8_t {
@@ -32,8 +29,10 @@ namespace YOBA {
 	};
 
 	enum class PCA9685OutputDriverMode : uint8_t {
-		openDrain,
-		totemPole
+		// Uses internal pull-up resistors (default mode)
+		totemPole,
+		// Requires external pull-up resistors and allows to attach heavy load with custom voltage range (see datasheet for details)
+		openDrain
 	};
 
 	class PCA9685 {
@@ -44,40 +43,53 @@ namespace YOBA {
 			PCA9685Error setup(
 				const i2c_master_bus_handle_t& bus,
 				const uint8_t address = baseI2CAddress,
-				const uint32_t clockSpeedHz = 400'000
+				const uint32_t clockSpeedHz = 400'000,
+
+				const PCA9685OutputDriverMode outputDriverMode = PCA9685OutputDriverMode::totemPole,
+				const PCA9685OutputChangeMode outputChangeMode = PCA9685OutputChangeMode::stop,
+				const bool autoIncrement = true,
+				const uint32_t frequencyHz = 50
 			) {
 				// -------------------------------- Device --------------------------------
 
-				i2c_device_config_t deviceConfig {};
-				deviceConfig.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-				deviceConfig.device_address = address;
-				deviceConfig.scl_speed_hz = clockSpeedHz;
+				{
+					i2c_device_config_t deviceConfig {};
+					deviceConfig.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+					deviceConfig.device_address = address;
+					deviceConfig.scl_speed_hz = clockSpeedHz;
 
-				const auto state = i2c_master_bus_add_device(bus, &deviceConfig, &_device);
+					const auto error = i2c_master_bus_add_device(bus, &deviceConfig, &_device);
 
-				if (state != ESP_OK) {
-					ESP_ERROR_CHECK_WITHOUT_ABORT(state);
-					return PCA9685Error::I2C;
+					if (error != ESP_OK) {
+						ESP_ERROR_CHECK_WITHOUT_ABORT(error);
+						return PCA9685Error::I2C;
+					}
 				}
 
-				return PCA9685Error::none;
-			}
+				// -------------------------------- Initial state --------------------------------
 
-
-			PCA9685Error restart() const {
-				const auto error = writeRegister(REG_MODE1, REG_MODE1_RESTART);
-
+				auto error = setOutputDriverMode(outputDriverMode);
 				if (error != PCA9685Error::none)
 					return error;
 
-				delayUs(500);
+				error = setOutputChangeMode(outputChangeMode);
+				if (error != PCA9685Error::none)
+					return error;
+
+				error = setAutoIncrement(autoIncrement);
+				if (error != PCA9685Error::none)
+					return error;
+
+				error = setFrequency(frequencyHz);
+				if (error != PCA9685Error::none)
+					return error;
 
 				return PCA9685Error::none;
 			}
 
 			PCA9685Error setFrequency(const uint32_t frequencyHz) const {
 				if (frequencyHz < 24 || frequencyHz > 1526) {
-					ESP_LOGE(_logTag, "frequency %d is out of range [24; 1526] Hz", frequencyHz);
+					ESP_LOGE(LOG_TAG, "frequency %d is out of range [24; 1526] Hz", frequencyHz);
 					return PCA9685Error::invalidArgument;
 				}
 
@@ -99,7 +111,7 @@ namespace YOBA {
 
 				delayUs(500);
 
-				// Prescale should be updated only in sleep mode, so...
+				// Prescale can be updated only in sleep mode, so...
 				error = writeRegister(REG_MODE1, (mode1 & ~REG_MODE1_RESTART) | REG_MODE1_SLEEP);
 
 				if (error != PCA9685Error::none)
@@ -140,13 +152,10 @@ namespace YOBA {
 
 			PCA9685Error setChannelValue(const uint8_t channel, const uint16_t on, const uint16_t off) const {
 				if (channel > 15) {
-					ESP_LOGE(_logTag, "channel %d is out of range [0; 15]", channel);
+					ESP_LOGE(LOG_TAG, "channel %d is out of range [0; 15]", channel);
 					return PCA9685Error::invalidArgument;
 				}
-				else if (!checkChannelValue(on)) {
-					return PCA9685Error::invalidArgument;
-				}
-				else if (!checkChannelValue(off)) {
+				else if (!checkChannelValue(on) || !checkChannelValue(off)) {
 					return PCA9685Error::invalidArgument;
 				}
 
@@ -156,27 +165,23 @@ namespace YOBA {
 				// readRegister(REG_MODE2, mode2);
 				// ESP_LOGI(_logTag, "mode1: %d, mode2: %d", mode1, mode2);
 
-				uint8_t data[5] {
-					// Reg
-					static_cast<uint8_t>(REG_LED0 + channel * 4),
+				constexpr static uint8_t bufferSize = 1 + 4;
 
-					// On low/high
-					static_cast<uint8_t>(on & 0xFF),
-					static_cast<uint8_t>(on >> 8),
-
-					// Off low/high
-					static_cast<uint8_t>(off & 0xFF),
-					static_cast<uint8_t>(off >> 8),
+				uint8_t buffer[bufferSize] {
+					static_cast<uint8_t>(REG_LED0 + channel * 4)
 				};
 
-				return write({ data, 5 });
+				*reinterpret_cast<uint16_t*>(buffer + 1) = on;
+				*reinterpret_cast<uint16_t*>(buffer + 3) = off;
+
+				return write({ buffer, bufferSize });
 			}
 
 			PCA9685Error setChannelDuty(const uint8_t channel, const uint16_t duty) const {
 				return setChannelValue(channel, 0, duty);
 			}
 
-			// Warning: should be used only with PCA9685OutputChangeMode::stop
+			// Warning: can be used only with PCA9685OutputChangeMode::stop
 			// Otherwise visual blinking may occur
 			PCA9685Error setChannelDuties(const uint16_t duty) const {
 				constexpr static uint8_t bufferSize = 1 + 4;
@@ -193,11 +198,11 @@ namespace YOBA {
 			template<uint8_t fromChannel, uint8_t channelCount>
 			PCA9685Error setChannelDuties(const std::array<uint16_t, channelCount>& duties) {
 				if (channelCount == 0) {
-					ESP_LOGE(_logTag, "channelCount should be > 0");
+					ESP_LOGE(LOG_TAG, "channelCount should be > 0");
 					return PCA9685Error::invalidArgument;
 				}
 				else if (fromChannel + channelCount > 15) {
-					ESP_LOGE(_logTag, "fromChannel + channelCount should be <= 15");
+					ESP_LOGE(LOG_TAG, "fromChannel + channelCount should be <= 15");
 					return PCA9685Error::invalidArgument;
 				}
 
@@ -243,23 +248,17 @@ namespace YOBA {
 		private:
 			// -------------------------------- Subtypes --------------------------------
 
-			constexpr static auto _logTag = "PCA9685";
+			constexpr static auto LOG_TAG = "PCA9685";
 
 			constexpr static uint8_t REG_MODE1 = 0x00;
 			constexpr static uint8_t REG_MODE1_RESTART = 1 << 7;
-			constexpr static uint8_t REG_MODE1_EXTCLK = 1 << 6;
 			constexpr static uint8_t REG_MODE1_AI = 1 << 5;
 			constexpr static uint8_t REG_MODE1_SLEEP = 1 << 4;
 
 			constexpr static uint8_t REG_MODE2 = 0x01;
-			constexpr static uint8_t REG_MODE2_INVRT = 1 << 4;
 			constexpr static uint8_t REG_MODE2_OCH = 1 << 3;
 			constexpr static uint8_t REG_MODE2_OUTDRV = 1 << 2;
 
-			constexpr static uint8_t REG_SUBADR1 = 0x02;
-			constexpr static uint8_t REG_SUBADR2 = 0x03;
-			constexpr static uint8_t REG_SUBADR3 = 0x04;
-			constexpr static uint8_t REG_ALLCALLADR = 0x05;
 			constexpr static uint8_t REG_LED0 = 0x06;                 // Start of LED registers, 4 bytes per each, LE
 			constexpr static uint8_t REG_ALL_LED = 0xFA;              // Start of all LEDs registers, 4 bytes in total, LE
 			constexpr static uint8_t REG_PRESCALE = 0xFE;
@@ -269,10 +268,20 @@ namespace YOBA {
 			i2c_master_dev_handle_t _device {};
 
 			PCA9685Error write(const std::span<const uint8_t> data) const {
-				const auto state = i2c_master_transmit(_device, data.data(), data.size(), 1'000);
-				ESP_ERROR_CHECK_WITHOUT_ABORT(state);
+				const auto ESPError = i2c_master_transmit(
+					_device,
+					data.data(),
+					data.size(),
+					500
+				);
 
-				return state == ESP_OK ? PCA9685Error::none : PCA9685Error::I2C;
+				if (ESPError != ESP_OK) {
+					ESP_ERROR_CHECK_WITHOUT_ABORT(ESPError);
+
+					return PCA9685Error::I2C;
+				}
+
+				return PCA9685Error::none;
 			}
 
 			PCA9685Error writeRegister(const uint8_t reg, const uint8_t value) const {
@@ -284,8 +293,26 @@ namespace YOBA {
 				return write({ data, 2 });
 			}
 
+			PCA9685Error readRegister(const uint8_t reg, uint8_t& value) const {
+				const auto ESPError = i2c_master_transmit_receive(
+					_device,
+					&reg,
+					1,
+					&value,
+					1,
+					500
+				);
+
+				if (ESPError != ESP_OK) {
+					ESP_ERROR_CHECK_WITHOUT_ABORT(ESPError);
+
+					return PCA9685Error::I2C;
+				}
+
+				return PCA9685Error::none;
+			}
+
 			PCA9685Error updateRegisterBit(const uint8_t reg, const uint8_t bit, const bool state) const {
-				// Reading current value
 				uint8_t value = 0;
 
 				const auto error = readRegister(reg, value);
@@ -293,31 +320,13 @@ namespace YOBA {
 				if (error != PCA9685Error::none)
 					return error;
 
-				// Prescale should be updated only in sleep mode, so...
 				return writeRegister(reg, (value & ~bit) | (state ? bit : 0));
-			}
-
-			PCA9685Error readRegister(const uint8_t reg, uint8_t& value) const {
-				const auto state = i2c_master_transmit_receive(
-					_device,
-
-					&reg,
-					1,
-
-					&value,
-					1,
-
-					1'000
-				);
-
-				ESP_ERROR_CHECK_WITHOUT_ABORT(state);
-
-				return state == ESP_OK ? PCA9685Error::none : PCA9685Error::I2C;
 			}
 
 			static bool checkChannelValue(const uint16_t value) {
 				if (value > 4095) {
-					ESP_LOGE(_logTag, "value %d is out of range [0; 4095]", value);
+					ESP_LOGE(LOG_TAG, "value %d is out of range [0; 4095]", value);
+
 					return false;
 				}
 
