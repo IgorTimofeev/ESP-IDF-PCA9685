@@ -35,40 +35,61 @@ namespace YOBA {
 		openDrain
 	};
 
+	// Defines channel behavior when OE pin is being in HIGH state
+	enum class PCA9685OutputDisabledMode : uint8_t {
+		// When OE pin is HIGH, channel output will be LOW (default)
+		low,
+		// When OE pin is HIGH, channel output will be HIGH (only for PCA9685OutputDriverMode = totemPole. In PCA9685OutputDisabledMode = openDrain behavior will be the same as floating)
+		high,
+		// When OE pin is HIGH, channel output will be in floating (or high-impedance) state, can be used to operate heavy load P-channel MOSFETs
+		floating
+	};
+
 	class PCA9685 {
 		public:
-			constexpr static uint8_t baseI2CAddress = 0x40;
+			// Use soldering iron to change address of your module. Then you can use custom address via PCA9685::I2CBaseAddress | 0b00000001
+			constexpr static uint8_t I2CBaseAddress = 0x40;
+			constexpr static uint32_t I2CDefaultFrequency = 400'000;
 			constexpr static uint8_t channelCount = 16;
 
+			// Manual setup for DS/Nioh players
 			PCA9685Error setup(
-				const i2c_master_bus_handle_t& bus,
-				const uint8_t address = baseI2CAddress,
-				const uint32_t clockSpeedHz = 400'000,
+				const i2c_master_bus_handle_t& I2CBus,
+				const uint8_t I2CAddress = I2CBaseAddress,
+				const uint32_t I2CFrequencyHz = I2CDefaultFrequency
+			) {
+				return internalSetup(
+					I2CBus,
+					I2CAddress,
+					I2CFrequencyHz
+				);
+			}
 
+			// Easy setup with pre-defined stuff in correct order for pussyboys
+			PCA9685Error setup(
+				const i2c_master_bus_handle_t& I2CBus,
+				const uint8_t I2CAddress = I2CBaseAddress,
+				const uint32_t I2CFrequencyHz = I2CDefaultFrequency,
+
+				const uint32_t PWMFrequencyHz = 50,
 				const PCA9685OutputDriverMode outputDriverMode = PCA9685OutputDriverMode::totemPole,
 				const PCA9685OutputChangeMode outputChangeMode = PCA9685OutputChangeMode::stop,
-				const bool autoIncrement = true,
-				const uint32_t frequencyHz = 50
+				const PCA9685OutputDisabledMode outputDisabledMode = PCA9685OutputDisabledMode::low,
+				const bool outputInverted = false,
+				const bool autoIncrement = true
 			) {
-				// -------------------------------- Device --------------------------------
+				auto error = internalSetup(
+					I2CBus,
+					I2CAddress,
+					I2CFrequencyHz
+				);
 
-				{
-					i2c_device_config_t deviceConfig {};
-					deviceConfig.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-					deviceConfig.device_address = address;
-					deviceConfig.scl_speed_hz = clockSpeedHz;
+				if (error != PCA9685Error::none)
+					return error;
 
-					const auto error = i2c_master_bus_add_device(bus, &deviceConfig, &_device);
+				// -------------------------------- Initialization --------------------------------
 
-					if (error != ESP_OK) {
-						ESP_ERROR_CHECK_WITHOUT_ABORT(error);
-						return PCA9685Error::I2C;
-					}
-				}
-
-				// -------------------------------- Initial state --------------------------------
-
-				auto error = setOutputDriverMode(outputDriverMode);
+				error = setOutputDriverMode(outputDriverMode);
 				if (error != PCA9685Error::none)
 					return error;
 
@@ -76,11 +97,19 @@ namespace YOBA {
 				if (error != PCA9685Error::none)
 					return error;
 
+				error = setOutputDisabledMode(outputDisabledMode);
+				if (error != PCA9685Error::none)
+					return error;
+
+				error = setOutputInverted(outputInverted);
+				if (error != PCA9685Error::none)
+					return error;
+
 				error = setAutoIncrement(autoIncrement);
 				if (error != PCA9685Error::none)
 					return error;
 
-				error = setFrequency(frequencyHz);
+				error = setFrequency(PWMFrequencyHz);
 				if (error != PCA9685Error::none)
 					return error;
 
@@ -138,6 +167,10 @@ namespace YOBA {
 				return PCA9685Error::none;
 			}
 
+			PCA9685Error setOutputInverted(const bool state) const {
+				return updateRegisterBit(REG_MODE2, REG_MODE2_INVRT, state);
+			}
+
 			PCA9685Error setAutoIncrement(const bool state) const {
 				return updateRegisterBit(REG_MODE1, REG_MODE1_AI, state);
 			}
@@ -150,12 +183,38 @@ namespace YOBA {
 				return updateRegisterBit(REG_MODE2, REG_MODE2_OUTDRV, mode == PCA9685OutputDriverMode::totemPole);
 			}
 
-			PCA9685Error setChannelValue(const uint8_t channel, const uint16_t on, const uint16_t off) const {
+			PCA9685Error setOutputDisabledMode(const PCA9685OutputDisabledMode mode) const {
+				uint8_t value = 0;
+
+				const auto error = readRegister(REG_MODE2, value);
+
+				if (error != PCA9685Error::none)
+					return error;
+
+				uint8_t bits;
+
+				switch (mode) {
+					case PCA9685OutputDisabledMode::low:
+						bits = 0b00;
+						break;
+					case PCA9685OutputDisabledMode::high:
+						bits = 0b01;
+						break;
+					// Floating
+					default:
+						bits = 0b11;
+						break;
+				}
+
+				return writeRegister(REG_MODE2, (value & 0b1111'1100) | bits);
+			}
+
+			PCA9685Error setDuty(const uint8_t channel, const uint16_t onDuty, const uint16_t offDuty) const {
 				if (channel > 15) {
 					ESP_LOGE(LOG_TAG, "channel %d is out of range [0; 15]", channel);
 					return PCA9685Error::invalidArgument;
 				}
-				else if (!checkChannelValue(on) || !checkChannelValue(off)) {
+				else if (!checkChannelValue(onDuty) || !checkChannelValue(offDuty)) {
 					return PCA9685Error::invalidArgument;
 				}
 
@@ -171,19 +230,19 @@ namespace YOBA {
 					static_cast<uint8_t>(REG_LED0 + channel * 4)
 				};
 
-				*reinterpret_cast<uint16_t*>(buffer + 1) = on;
-				*reinterpret_cast<uint16_t*>(buffer + 3) = off;
+				*reinterpret_cast<uint16_t*>(buffer + 1) = onDuty;
+				*reinterpret_cast<uint16_t*>(buffer + 3) = offDuty;
 
 				return write({ buffer, bufferSize });
 			}
 
-			PCA9685Error setChannelDuty(const uint8_t channel, const uint16_t duty) const {
-				return setChannelValue(channel, 0, duty);
+			PCA9685Error setDuty(const uint8_t channel, const uint16_t duty) const {
+				return setDuty(channel, 0, duty);
 			}
 
 			// Warning: can be used only with PCA9685OutputChangeMode::stop
 			// Otherwise visual blinking may occur
-			PCA9685Error setChannelDuties(const uint16_t duty) const {
+			PCA9685Error setDuties(const uint16_t duty) const {
 				constexpr static uint8_t bufferSize = 1 + 4;
 
 				uint8_t buffer[bufferSize] {
@@ -196,13 +255,13 @@ namespace YOBA {
 			}
 
 			template<uint8_t fromChannel, uint8_t channelCount>
-			PCA9685Error setChannelDuties(const std::array<uint16_t, channelCount>& duties) {
+			PCA9685Error setDuties(const std::array<uint16_t, channelCount>& duties) {
 				if (channelCount == 0) {
 					ESP_LOGE(LOG_TAG, "channelCount should be > 0");
 					return PCA9685Error::invalidArgument;
 				}
-				else if (fromChannel + channelCount > 15) {
-					ESP_LOGE(LOG_TAG, "fromChannel + channelCount should be <= 15");
+				else if (fromChannel + channelCount > 16) {
+					ESP_LOGE(LOG_TAG, "fromChannel + channelCount should be <= 16");
 					return PCA9685Error::invalidArgument;
 				}
 
@@ -225,8 +284,8 @@ namespace YOBA {
 				return write({ buffer, bufferSize });
 			}
 
-			PCA9685Error setChannelDuties(const std::array<uint16_t, channelCount>& duties) {
-				return setChannelDuties<0, channelCount>(duties);
+			PCA9685Error setDuties(const std::array<uint16_t, channelCount>& duties) {
+				return setDuties<0, channelCount>(duties);
 			}
 
 			static void errorToString(const PCA9685Error error, const std::span<char> str) {
@@ -236,7 +295,7 @@ namespace YOBA {
 						break;
 
 					case PCA9685Error::I2C:
-						std::strncpy(str.data(), "I2C", str.size());
+						std::strncpy(str.data(), "I2C or wiring failure", str.size());
 						break;
 
 					default:
@@ -256,6 +315,7 @@ namespace YOBA {
 			constexpr static uint8_t REG_MODE1_SLEEP = 1 << 4;
 
 			constexpr static uint8_t REG_MODE2 = 0x01;
+			constexpr static uint8_t REG_MODE2_INVRT = 1 << 4;
 			constexpr static uint8_t REG_MODE2_OCH = 1 << 3;
 			constexpr static uint8_t REG_MODE2_OUTDRV = 1 << 2;
 
@@ -336,6 +396,26 @@ namespace YOBA {
 			static void delayUs(const uint32_t us) {
 				// esp_rom_delay_us() would be better, but nah
 				vTaskDelay(pdMS_TO_TICKS(std::max<uint32_t>(us / 1'000, portTICK_PERIOD_MS)));
+			}
+
+			PCA9685Error internalSetup(
+				const i2c_master_bus_handle_t& I2CBus,
+				const uint8_t I2CAddress,
+				const uint32_t I2CFrequencyHz
+			) {
+				i2c_device_config_t deviceConfig {};
+				deviceConfig.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+				deviceConfig.device_address = I2CAddress;
+				deviceConfig.scl_speed_hz = I2CFrequencyHz;
+
+				const auto error = i2c_master_bus_add_device(I2CBus, &deviceConfig, &_device);
+
+				if (error != ESP_OK) {
+					ESP_ERROR_CHECK_WITHOUT_ABORT(error);
+					return PCA9685Error::I2C;
+				}
+
+				return PCA9685Error::none;
 			}
 	};
 }
