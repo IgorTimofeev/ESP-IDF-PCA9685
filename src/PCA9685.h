@@ -87,7 +87,7 @@ namespace YOBA {
 				if (error != PCA9685Error::none)
 					return error;
 
-				// -------------------------------- Initialization --------------------------------
+				// -------------------------------- Initialization sequence --------------------------------
 
 				error = setOutputDriverMode(outputDriverMode);
 				if (error != PCA9685Error::none)
@@ -138,13 +138,14 @@ namespace YOBA {
 				if (error != PCA9685Error::none)
 					return error;
 
-				delayUs(500);
-
 				// Prescale can be updated only in sleep mode, so...
 				error = writeRegister(REG_MODE1, (mode1 & ~REG_MODE1_RESTART) | REG_MODE1_SLEEP);
 
 				if (error != PCA9685Error::none)
 					return error;
+
+				// Datasheet says that when leaving sleep mode, we should give oscillator at least of 500 us to gain some pussy juice
+				delayUs(500);
 
 				// Updating prescale
 				error = writeRegister(REG_PRESCALE, prescale);
@@ -158,7 +159,7 @@ namespace YOBA {
 				if (error != PCA9685Error::none)
 					return error;
 
-				// Datasheet says that when leaving sleep mode, we should give oscillator at least of 500 us to gain some pussy juice
+				// SLEEPING AGAAAAIN
 				delayUs(500);
 
 				// readRegister(REG_MODE1, mode1);
