@@ -122,13 +122,19 @@ namespace YOBA {
 					return PCA9685Error::invalidArgument;
 				}
 
-				// prescale = round(osc_clock / (4096 * frequencyHz)) - 1
+				// Computing prescale value. From datasheet:
+				// prescale = round(osc_clock / (4096 * frequency_hz)) - 1
+
 				// osc_clock = 25 MHz
-				const auto prescale =  std::clamp<uint8_t>(
-					static_cast<uint8_t>(25'000'000 / (4096 * frequencyHz)),
-					3,
-					255
-				);
+				// const auto prescale =  std::clamp<uint8_t>(
+				// 	static_cast<uint8_t>(25'000'000 / (4096 * frequencyHz)),
+				// 	3,
+				// 	255
+				// );
+
+				constexpr static uint32_t oscClockHz = 25'000'000;
+				const uint32_t prescaleDivider = 4096 * frequencyHz;
+				const uint8_t prescale = static_cast<uint8_t>((oscClockHz + prescaleDivider / 2) / prescaleDivider) - 1;
 
 				// Reading current mode1 reg value
 				uint8_t mode1 = 0;
