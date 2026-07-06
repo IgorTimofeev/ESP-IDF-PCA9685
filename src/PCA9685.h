@@ -261,7 +261,7 @@ namespace YOBA {
 				return write({ buffer, bufferSize });
 			}
 
-			template<uint8_t fromChannel, uint8_t channelCount>
+			template<size_t fromChannel, size_t channelCount>
 			PCA9685Error setDuties(const std::array<uint16_t, channelCount>& duties) {
 				if (channelCount == 0) {
 					ESP_LOGE(LOG_TAG, "channelCount should be > 0");
